@@ -1,0 +1,84 @@
+# Benchmarks primus-fhe, unmodified, on GitHub's x86_64 hosted runners.
+# Three independent runs, so run-to-run variance on shared hardware is visible
+# rather than hidden. Each run uploads its own JSON and logs.
+#
+# Trigger it by hand: Actions tab -> primus-fhe bench -> Run workflow.
+name: primus-fhe bench
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: primus-fhe commit to benchmark
+        default: 32b316b6728c32477ff93934d74943c29c37e52b
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      max-parallel: 1          # one at a time, never two benches on one host
+      matrix:
+        run: [1, 2, 3]
+    steps:
+      - name: Checkout this repo (for collect.py)
+        uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          rustup update stable
+          rustup default stable
+          rustc --version
+          cargo --version
+
+      - name: Clone primus-fhe at the pinned commit
+        run: |
+          git clone https://github.com/primus-labs/primus-fhe.git fhe
+          cd fhe
+          git checkout "${{ inputs.commit }}"
+          git log -1 --format='%H %cs %s'
+
+      - name: Record the CPU and the SIMD flags the NTT dispatch reads
+        run: |
+          lscpu | sed -n '1,20p'
+          echo "--- flags primus_ntt checks ---"
+          grep -o -w 'avx2\|avx512f\|avx512dq\|avx512ifma' /proc/cpuinfo | sort -u
+
+      - name: Build (fails the job if the library does not build)
+        working-directory: fhe
+        run: cargo build --workspace --release --all-targets 2>&1 | tail -40
+
+      - name: Bench, NTT u64 (the core of the chapter)
+        working-directory: fhe
+        run: cargo bench -p primus_ntt --bench bench_u64 2>&1 | tee ../ntt_u64.log
+
+      - name: Bench, NTT u32
+        working-directory: fhe
+        continue-on-error: true
+        run: cargo bench -p primus_ntt --bench bench_u32 2>&1 | tee ../ntt_u32.log
+
+      - name: Bench, RNS decompose
+        working-directory: fhe
+        continue-on-error: true
+        run: cargo bench -p primus_rns --bench decompose 2>&1 | tee ../rns_decompose.log
+
+      - name: Bench, Gaussian sampling
+        working-directory: fhe
+        continue-on-error: true
+        run: cargo bench -p primus_distr --bench sample_gaussian 2>&1 | tee ../distr_gaussian.log
+
+      - name: Collect
+        run: python3 collect.py fhe "primus-fhe-bench-run${{ matrix.run }}.json"
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: primus-fhe-bench-run${{ matrix.run }}
+          path: |
+            primus-fhe-bench-run${{ matrix.run }}.json
+            *.log
