@@ -13,7 +13,7 @@ jobs:
     timeout-minutes: 60
     env:
       CARGO_BUILD_RUSTFLAGS: ""
-      C4_OUTPUT: ${{ runner.temp }}/primus-fhe-c4
+      C4_OUTPUT: /tmp/primus-fhe-c4
       C4_REF: ${{ matrix.ref }}
       C4_ATTEMPT: ${{ matrix.attempt }}
     strategy:
@@ -156,7 +156,7 @@ jobs:
     timeout-minutes: 60
     env:
       CARGO_BUILD_RUSTFLAGS: ""
-      C4_OUTPUT: ${{ runner.temp }}/primus-fhe-c4-nightly
+      C4_OUTPUT: /tmp/primus-fhe-c4-nightly
     steps:
       - uses: actions/checkout@v6
         with:
