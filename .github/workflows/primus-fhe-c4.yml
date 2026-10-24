@@ -1,0 +1,198 @@
+name: primus-fhe C4 control
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  roundtrip:
+    name: roundtrip (${{ matrix.ref }}, attempt ${{ matrix.attempt }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_RUSTFLAGS: ""
+      C4_OUTPUT: ${{ runner.temp }}/primus-fhe-c4
+      C4_REF: ${{ matrix.ref }}
+      C4_ATTEMPT: ${{ matrix.attempt }}
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        ref:
+          - 32b316b6728c32477ff93934d74943c29c37e52b
+          - 32702f9741c126081b8fce3ecdf531ca31ddab67
+        attempt: [1, 2, 3, 4, 5]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: Zhekinmaksim/primus-fhe
+          ref: ${{ matrix.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-rust
+      - name: Record CPU and source provenance
+        shell: bash
+        run: |
+          mkdir -p "$C4_OUTPUT"
+          lscpu | sed -n '1,20p' | tee "$C4_OUTPUT/cpu.txt"
+          { grep -o -w 'avx2\|avx512f\|avx512dq\|avx512ifma' /proc/cpuinfo || true; } | sort -u | tee "$C4_OUTPUT/cpu-flags.txt"
+          rustc --version | tee "$C4_OUTPUT/rustc.txt"
+          cargo --version | tee "$C4_OUTPUT/cargo.txt"
+          python3 - <<'PY'
+          import json, os, pathlib, platform, subprocess
+          output = pathlib.Path(os.environ['C4_OUTPUT'])
+          commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          assert commit == os.environ['C4_REF']
+          status = subprocess.check_output(['git', 'status', '--porcelain', '--untracked-files=no'], text=True)
+          assert not status
+          info = pathlib.Path('/proc/cpuinfo').read_text().splitlines()
+          cpu = next(line.split(':', 1)[1].strip() for line in info if line.lower().startswith('model name'))
+          flags = (output / 'cpu-flags.txt').read_text().split()
+          data = {'ref': commit, 'attempt': int(os.environ['C4_ATTEMPT']), 'cpu': cpu,
+                  'flags': flags, 'arch': platform.machine(), 'runner_name': os.environ.get('RUNNER_NAME'),
+                  'runner_arch': os.environ.get('RUNNER_ARCH'), 'tracked_status_before': status}
+          (output / 'machine.json').write_text(json.dumps(data, indent=2) + '\n')
+          PY
+      - name: Upstream stable tests
+        id: nextest
+        continue-on-error: true
+        shell: bash
+        run: |
+          ulimit -c 0
+          set +e
+          cargo nextest run --workspace 2>&1 | tee "$C4_OUTPUT/nextest.log"
+          nextest_exit=${PIPESTATUS[0]}
+          set -e
+          echo "$nextest_exit" > "$C4_OUTPUT/nextest-exit-code.txt"
+          echo "exit_code=$nextest_exit" >> "$GITHUB_OUTPUT"
+          python3 - <<'PY'
+          import os, pathlib, re
+          text = (pathlib.Path(os.environ['C4_OUTPUT']) / 'nextest.log').read_text()
+          text = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', text)
+          crashed = any('test_round_trip' in line and any(s in line for s in ('SIGSEGV', 'SIGILL', 'SIGABRT')) for line in text.splitlines())
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write('target_crash=' + str(crashed).lower() + '\n')
+          PY
+          exit "$nextest_exit"
+      - name: Run the exact round-trip test 200 times
+        id: hammer
+        shell: bash
+        run: |
+          ulimit -c 0
+          for i in $(seq 1 200); do
+            cargo test -q -p primus_ntt --lib ntt::prime32::table::tests::test_round_trip \
+              -- --exact > /dev/null 2>&1 || echo "attempt $i: exit $?"
+          done | tee "$C4_OUTPUT/roundtrip-loop.txt"
+          crash_count=$(wc -l < "$C4_OUTPUT/roundtrip-loop.txt")
+          echo "crashes: $crash_count / 200" | tee "$C4_OUTPUT/roundtrip-summary.txt"
+          echo "crashes=$crash_count" >> "$GITHUB_OUTPUT"
+      - name: Prepare ASan on the same crashing base runner
+        if: >-
+          ${{ matrix.ref == '32b316b6728c32477ff93934d74943c29c37e52b' &&
+              ((steps.hammer.outputs.crashes != '' && steps.hammer.outputs.crashes != '0') || steps.nextest.outputs.target_crash == 'true') }}
+        shell: bash
+        run: |
+          rustup toolchain install nightly --component rust-src 2>&1 | tee "$C4_OUTPUT/asan-toolchain.log"
+          rustc +nightly --version | tee "$C4_OUTPUT/asan-rustc.txt"
+          if ! command -v llvm-symbolizer >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y llvm
+          fi
+          echo "ASAN_SYMBOLIZER_PATH=$(command -v llvm-symbolizer)" >> "$GITHUB_ENV"
+      - name: ASan on unmodified base only
+        id: asan
+        if: >-
+          ${{ matrix.ref == '32b316b6728c32477ff93934d74943c29c37e52b' &&
+              ((steps.hammer.outputs.crashes != '' && steps.hammer.outputs.crashes != '0') || steps.nextest.outputs.target_crash == 'true') }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          RUSTFLAGS="-Zsanitizer=address" RUSTDOCFLAGS="-Zsanitizer=address" \
+            cargo +nightly test -Zbuild-std --target x86_64-unknown-linux-gnu \
+            -p primus_ntt --lib ntt::prime32 -- --test-threads=1 2>&1 | tee "$C4_OUTPUT/asan.log"
+          asan_exit=${PIPESTATUS[0]}
+          set -e
+          echo "$asan_exit" > "$C4_OUTPUT/asan-exit-code.txt"
+          exit "$asan_exit"
+      - name: Collect outcomes without changing source
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, re, subprocess
+          output = pathlib.Path(os.environ['C4_OUTPUT'])
+          output.mkdir(parents=True, exist_ok=True)
+          machine = output / 'machine.json'
+          data = json.loads(machine.read_text()) if machine.exists() else {'ref': os.environ['C4_REF'], 'attempt': int(os.environ['C4_ATTEMPT'])}
+          for kind in ('nextest', 'asan'):
+              path = output / (kind + '-exit-code.txt')
+              data[kind + '_exit_code'] = int(path.read_text()) if path.exists() else None
+          loop = output / 'roundtrip-loop.txt'
+          data['loop_attempts'] = 200 if (output / 'roundtrip-summary.txt').exists() else None
+          data['loop_failures'] = len(loop.read_text().splitlines()) if loop.exists() else None
+          data['loop_failure_definition'] = 'Nonzero cargo test exit status, as counted by the supplied loop; individual signals are not captured by that loop.'
+          data['tracked_status_after'] = subprocess.check_output(['git', 'status', '--porcelain', '--untracked-files=no'], text=True)
+          (output / 'result.json').write_text(json.dumps(data, indent=2) + '\n')
+          assert not data['tracked_status_after'], data['tracked_status_after']
+          PY
+      - name: Upload every diagnostic even when tests fail
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: c4-${{ matrix.ref }}-${{ matrix.attempt }}
+          path: ${{ env.C4_OUTPUT }}
+          if-no-files-found: error
+
+  nightly-base:
+    name: nightly clippy (unmodified base)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_RUSTFLAGS: ""
+      C4_OUTPUT: ${{ runner.temp }}/primus-fhe-c4-nightly
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: Zhekinmaksim/primus-fhe
+          ref: 32b316b6728c32477ff93934d74943c29c37e52b
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-rust
+      - name: Record base and CPU
+        shell: bash
+        run: |
+          mkdir -p "$C4_OUTPUT"
+          git rev-parse HEAD | tee "$C4_OUTPUT/ref.txt"
+          lscpu | sed -n '1,20p' | tee "$C4_OUTPUT/cpu.txt"
+          { grep -o -w 'avx2\|avx512f\|avx512dq\|avx512ifma' /proc/cpuinfo || true; } | sort -u | tee "$C4_OUTPUT/cpu-flags.txt"
+          rustc +nightly --version | tee "$C4_OUTPUT/rustc.txt"
+          git diff --exit-code
+      - name: Upstream nightly clippy once on base
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          cargo +nightly clippy --workspace --all-features -- -D warnings 2>&1 | tee "$C4_OUTPUT/clippy.log"
+          clippy_exit=${PIPESTATUS[0]}
+          set -e
+          echo "$clippy_exit" > "$C4_OUTPUT/clippy-exit-code.txt"
+          exit "$clippy_exit"
+      - name: Check source remained unchanged
+        if: always()
+        run: git diff --exit-code && git diff --cached --exit-code
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: c4-nightly-base
+          path: ${{ env.C4_OUTPUT }}
+          if-no-files-found: error
